@@ -1,0 +1,6 @@
+telethon>=1.28
+pytz>=2023.3
+flask>=2.3
+python-dotenv>=1.0
+psutil>=5.9
+requests
