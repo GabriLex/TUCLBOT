@@ -2,93 +2,158 @@ import asyncio
 import logging
 from threading import Thread
 from flask import Flask
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.errors import (
     RPCError, FloodWaitError,
     SessionPasswordNeededError,
     PhoneNumberUnoccupiedError
 )
 
-# Configurazione da variabili d'ambiente (Render le inietta automaticamente)
+# Configurazione da variabili d'ambiente
 import os
 BOT_TOKEN = os.environ['BOT_TOKEN']
 API_ID = int(os.environ['API_ID'])
 API_HASH = os.environ['API_HASH']
 
-# Inizializzazione app Flask
 app = Flask(__name__)
 
 class TUCLBot:
     def __init__(self):
-        # Stato connessione
+        # Stato del bot
         self.client = None
-        self.is_connected = False
-        
-        # Configurazione logging per Render
+        self.user_sessions = {}  # Sessioni utente
+        self.login_attempts = {}  # Tentativi di login
+        self.limited_mode = False  # Modalità limitata
+        self.allowed_chats = set()  # Chat autorizzate
+
+        # Configurazione logging
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.StreamHandler()  # Log su stdout (obbligatorio per Render)
-            ]
+            handlers=[logging.StreamHandler()]
         )
         self.logger = logging.getLogger(__name__)
 
-    async def connect(self):
-        """Connessione con gestione errori specifica per Render"""
+    async def init_user_session(self, user_id, api_id=None, api_hash=None, phone=None, code=None, password=None):
+        """Gestione completa del login utente"""
         try:
-            self.client = TelegramClient(
-                'tucl_session',
-                API_ID,
-                API_HASH,
-                connection_retries=None
+            # Disconnessione sessioni esistenti
+            if user_id in self.user_sessions:
+                await self.user_sessions[user_id].disconnect()
+
+            client = TelegramClient(
+                f'tucl_user_{user_id}',
+                api_id or API_ID,
+                api_hash or API_HASH
             )
             
-            await self.client.start(bot_token=BOT_TOKEN)
-            self.is_connected = True
-            self.logger.info("✅ Connesso a Telegram")
-            return True
+            await client.connect()
             
-        except RPCError as e:
-            self.logger.error(f"Errore RPC: {str(e)}")
-            return False
+            if not await client.is_user_authorized():
+                if not phone:
+                    return 'NEED_PHONE'
+                
+                sent_code = await client.send_code_request(phone)
+                self.login_attempts[user_id] = {
+                    'client': client,
+                    'phone': phone,
+                    'phone_code_hash': sent_code.phone_code_hash
+                }
+                return 'NEED_CODE'
+                
+            self.user_sessions[user_id] = client
+            return client
+            
         except Exception as e:
-            self.logger.critical(f"Errore connessione: {str(e)}")
-            return False
+            self.logger.error(f"Errore login: {e}")
+            return None
 
     async def setup_handlers(self):
-        """Configurazione handler per Render"""
+        """Tutti gli handler originali del TUCL Bot"""
+
         @self.client.on(events.NewMessage(pattern='/start'))
         async def start_handler(event):
-            await event.respond("🚀 TUCL Bot attivo su Render!")
-            
-        @self.client.on(events.NewMessage(pattern='/ping'))
-        async def ping_handler(event):
-            await event.respond("🏓 Pong! Connessione stabile")
+            await event.respond(
+                "👋 TUCL Bot - Tutte le funzioni attive!\n"
+                "Comandi disponibili:\n"
+                "/login - Accedi con le tue API\n"
+                "/settings - Gestisci il bot\n"
+                "/list_chats - Mostra le tue chat"
+            )
 
-    async def run(self):
-        """Loop principale ottimizzato per Render"""
-        while True:
-            if not self.is_connected:
-                if not await self.connect():
-                    self.logger.info("🔄 Tentativo di riconnessione tra 10s...")
-                    await asyncio.sleep(10)
-                    continue
-                    
-                await self.setup_handlers()
+        @self.client.on(events.NewMessage(pattern=r'/login (\d+) (\w+) (\+\d+)'))
+        async def login_handler(event):
+            user_id = event.sender_id
+            api_id = int(event.pattern_match.group(1))
+            api_hash = event.pattern_match.group(2)
+            phone = event.pattern_match.group(3)
+            
+            result = await self.init_user_session(
+                user_id=user_id,
+                api_id=api_id,
+                api_hash=api_hash,
+                phone=phone
+            )
+            
+            if result == 'NEED_CODE':
+                await event.respond("📱 Codice inviato! Usa /verify_code XXXX")
+
+        @self.client.on(events.NewMessage(pattern=r'/verify_code (\d+)'))
+        async def verify_code_handler(event):
+            user_id = event.sender_id
+            code = event.pattern_match.group(1)
+            
+            if user_id not in self.login_attempts:
+                await event.respond("❌ Prima esegui /login")
+                return
                 
             try:
-                self.logger.info("🤖 In ascolto di messaggi...")
+                await self.login_attempts[user_id]['client'].sign_in(
+                    phone=self.login_attempts[user_id]['phone'],
+                    code=code,
+                    phone_code_hash=self.login_attempts[user_id]['phone_code_hash']
+                )
+                await event.respond("✅ Login completato!")
+            except SessionPasswordNeededError:
+                await event.respond("🔐 Inserisci la password 2FA con /verify_2fa PASSWORD")
+            except Exception as e:
+                await event.respond(f"❌ Errore: {str(e)}")
+
+        @self.client.on(events.NewMessage(pattern='/list_chats'))
+        async def list_chats_handler(event):
+            user_id = event.sender_id
+            if user_id not in self.user_sessions:
+                await event.respond("❌ Devi prima fare il login")
+                return
+                
+            try:
+                dialogs = await self.user_sessions[user_id].get_dialogs()
+                response = "📚 Le tue chat:\n" + "\n".join(
+                    f"{dialog.name}" for dialog in dialogs[:10]  # Limite a 10 chat
+                )
+                await event.respond(response)
+            except Exception as e:
+                await event.respond(f"❌ Errore: {str(e)}")
+
+    async def run(self):
+        """Loop principale con riconnessione automatica"""
+        while True:
+            try:
+                self.client = TelegramClient('tucl_main', API_ID, API_HASH)
+                await self.client.start(bot_token=BOT_TOKEN)
+                
+                await self.setup_handlers()
+                self.logger.info("✅ Bot avviato con tutte le funzioni")
                 await self.client.run_until_disconnected()
                 
-            except (FloodWaitError, RPCError) as e:
-                wait_time = e.seconds if hasattr(e, 'seconds') else 15
-                self.logger.warning(f"⏳ Disconnessione temporanea. Riprovo tra {wait_time}s...")
-                self.is_connected = False
-                await asyncio.sleep(wait_time)
+            except FloodWaitError as e:
+                self.logger.warning(f"⏳ FloodWait: aspetta {e.seconds}s")
+                await asyncio.sleep(e.seconds)
+            except RPCError as e:
+                self.logger.error(f"🔌 Errore connessione: {str(e)}")
+                await asyncio.sleep(10)
             except Exception as e:
-                self.logger.error(f"💥 Errore runtime: {str(e)}")
-                self.is_connected = False
+                self.logger.critical(f"💥 Errore: {str(e)}")
                 await asyncio.sleep(30)
 
 def run_webserver():
@@ -96,24 +161,12 @@ def run_webserver():
     @app.route('/')
     def home():
         return "🟢 TUCL Bot Online", 200
-        
-    @app.route('/ping')
-    def ping():
-        return "🏓 Pong", 200
-        
     app.run(host='0.0.0.0', port=8000)
 
 async def main():
     bot = TUCLBot()
-    
-    # Avvia web server in thread separato
     Thread(target=run_webserver, daemon=True).start()
-    bot.logger.info("🌐 Web server avviato su porta 8000")
-    
-    try:
-        await bot.run()
-    except KeyboardInterrupt:
-        bot.logger.info("🛑 Arresto manuale")
+    await bot.run()
 
 if __name__ == '__main__':
     asyncio.run(main())
